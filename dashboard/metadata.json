@@ -1,0 +1,5 @@
+{
+  "name": "SafeGuard IoT Dashboard",
+  "description": "Bảng điều khiển Material Design cao cấp để giám sát hệ thống báo cháy dựa trên ESP32. Tính năng hiển thị cảm biến thời gian thực, trạng thái thiết bị, ghi lịch sử và cấu hình từ xa.",
+  "requestFramePermissions": []
+}
