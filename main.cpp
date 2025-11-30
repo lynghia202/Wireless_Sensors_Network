@@ -9,7 +9,7 @@
 #include <DHT.h>
 #include <ESPmDNS.h>
 
-// Bật các tính năng: SMTP để gửi mail, DEBUG để in log (nếu dùng)
+
 #define ENABLE_SMTP
 #define ENABLE_DEBUG
 #include <ReadyMail.h>
@@ -19,7 +19,7 @@
 // ====== CẤU HÌNH CHÂN ======
 // Các định nghĩa chân kết nối với phần cứng trên bo mạch ESP32
 // Input Sensors
-#define PIN_BUTTON_RESET 21  // Nút nhấn Reset WiFi (kéo xuống GND qua trở 10k)
+#define PIN_BUTTON_RESET 21  // Nút nhấn Reset WiFi 
 #define PIN_DHT          26  // Chân nối DHT22
 #define PIN_MQ02         34  // Đầu vào analog cho cảm biến khí (MQ2/MQ135)
 #define PIN_IR_SENSOR    33  // Đầu vào analog/digital cho cảm biến IR (lửa)
@@ -32,7 +32,7 @@
 #define PIN_RELAY_FAN    17
 #define PIN_RELAY_PUMP   18
 #define PIN_RELAY_BUZZER 19
-#define RELAY_ACTIVE     LOW // Nhiều module relay là active-low
+#define RELAY_ACTIVE     LOW 
 
 // ====== CẤU HÌNH DHT ======
 #define DHTTYPE DHT22
@@ -47,6 +47,10 @@ DHT dht(PIN_DHT, DHTTYPE);
 #define AUTHOR_PASSWORD "blev fslf uesq rgra"
 // Email mặc định nếu chưa cấu hình (có thể bị ghi đè bởi file)
 String g_recipientEmail = "lynghia736@gmail.com";
+
+// --- BIẾN TOÀN CỤC CHO VIỆC DEBUG WIFI ---
+unsigned long t_wifi_lost_start = 0;
+bool wasWiFiConnected = true; // Giả định ban đầu là có mạng (hoặc cập nhật trong setup)
 
 // ====== BIẾN TOÀN CỤC ======
 // Các biến volatile vì chúng có thể truy cập từ nhiều task/ISR
@@ -95,6 +99,39 @@ void loadSettings();
 void saveSettings();
 void checkResetButton();
 void updateStatusLEDs();
+// ====== THÔNG SỐ DATASHEET MQ2 ======
+// Điện trở tải trên bo mạch 
+#define RL_VALUE         10.0  
+// Hệ số Rs/R0 trong không khí sạch 
+#define RO_CLEAN_AIR_FACTOR 9.83 
+
+// Hằng số cho đường LPG/Smoke (Tính từ Fig 1)
+#define MQ2_A  672  
+#define MQ2_B -2.06
+float g_MQ2_R0 = 20.0; // Giá trị R0 hiệu chuẩn (đo trong không khí sạch)
+
+// Hàm 1: Đổi giá trị ADC (0-4095) sang Điện áp (V)
+float getVoltage(int raw_adc) {
+  return raw_adc * (3.3 / 4095.0);
+}
+
+// Hàm 2: Tính điện trở cảm biến (Rs)
+float getResistance(int raw_adc) {
+  float v_out = getVoltage(raw_adc);
+  if (v_out == 0) return 99999; 
+  return (5 - v_out) * RL_VALUE / v_out; 
+}
+// Hàm 3: Tính nồng độ khí PPM từ giá trị ADC
+int MQGetPPM(int mq_pin) {
+  float rs = getResistance(analogRead(mq_pin));
+  float ratio = rs / g_MQ2_R0; // Tính tỷ số Rs/R0
+    // Công thức hàm mũ: PPM = a * (ratio)^b
+  double ppm = MQ2_A * pow(ratio, MQ2_B);
+  
+  if (ppm < 0) ppm = 0;
+  if (ppm > 10000) ppm = 10000; // Giới hạn max của Datasheet là 10000
+  return (int)ppm;
+}
 
 // --- CÁC HÀM QUẢN LÝ CẤU HÌNH  ---
 
@@ -173,9 +210,18 @@ void addHistoryEvent(String message, bool isDanger) {
 // --- SETUP ---
 
 void setup() {
+  // [MỐC 0] Bắt đầu cấp nguồn (gần như 0ms)
+  unsigned long t_boot_start = millis(); 
+  
   Serial.begin(115200);
+  // Đợi Serial ổn định một chút để không mất chữ đầu
+  while(!Serial && millis() < 100); 
+  
+  Serial.println("\n=========================================");
+  Serial.println("[BOOT] HỆ THỐNG BẮT ĐẦU KHỞI ĐỘNG...");
+  Serial.print("[TIME] T0 (Power On): "); Serial.println(t_boot_start);
 
-  // Khởi tạo chế độ các chân I/O
+  // 1. KHỞI TẠO PHẦN CỨNG (GPIO, DHT)
   pinMode(PIN_BUTTON_RESET, INPUT);
   pinMode(PIN_LED_WIFI_OK, OUTPUT);
   pinMode(PIN_LED_WIFI_ERR, OUTPUT);
@@ -185,64 +231,69 @@ void setup() {
   pinMode(PIN_RELAY_PUMP, OUTPUT);
   pinMode(PIN_RELAY_FAN, OUTPUT);
 
-  // Đặt trạng thái ban đầu cho LED/Relay (tắt)
   digitalWrite(PIN_LED_WIFI_OK,  HIGH);
   digitalWrite(PIN_LED_WIFI_ERR, HIGH);
-
+  // Quan trọng: Tắt Relay ngay lập tức để an toàn (Safe State)
   digitalWrite(PIN_RELAY_BUZZER, !RELAY_ACTIVE);
   digitalWrite(PIN_RELAY_PUMP, !RELAY_ACTIVE);
   digitalWrite(PIN_RELAY_FAN, !RELAY_ACTIVE);
 
   dht.begin();
+  
+  // [MỐC 1] Xong phần cứng cơ bản
+  unsigned long t_hw_init_done = millis();
+  Serial.print("[TIME] T1 (Hardware Init): "); Serial.println(t_hw_init_done);
 
-  // Mount SPIFFS (tạo nếu chưa có) để lưu/đọc file cấu hình
+  // 2. KHỞI TẠO FILE SYSTEM & CẤU HÌNH
   if (!SPIFFS.begin(true)) {
-    Serial.println("Lỗi Mount SPIFFS");
-    return;
+    Serial.println("[ERR] Lỗi Mount SPIFFS");
   }
-
-  // Tải cấu hình từ SPIFFS khi khởi động
   loadSettings();
 
-  // Cấu hình WiFi (station) và portal nếu cần
-  WiFi.mode(WIFI_STA);
-  wm.setConfigPortalTimeout(180); // timeout portal (s)
-  digitalWrite(PIN_LED_WIFI_ERR, LOW);
-  digitalWrite(PIN_LED_WIFI_OK,  HIGH);
+  // [MỐC 2] Xong File System
+  unsigned long t_fs_done = millis();
+  Serial.print("[TIME] T2 (SPIFFS & Settings): "); Serial.println(t_fs_done);
 
-  // autoConnect sẽ mở captive portal nếu không có kết nối
+  // 3. KẾT NỐI WIFI (Giai đoạn lâu nhất)
+  WiFi.mode(WIFI_STA);
+  wm.setConfigPortalTimeout(180);
+  
+  Serial.println("[BOOT] Đang kết nối WiFi...");
   if (!wm.autoConnect("ESP32_Fire_Smart_V2")) {
-    Serial.println("Chưa kết nối WiFi, chạy offline.");
+    Serial.println("[WARN] Chạy offline.");
   } else {
-    Serial.println("Đã kết nối WiFi: " + WiFi.SSID());
-    Serial.print("IP: "); Serial.println(WiFi.localIP());
-    digitalWrite(PIN_LED_WIFI_ERR, HIGH);
-    digitalWrite(PIN_LED_WIFI_OK, LOW);
+    Serial.println("[INFO] WiFi Connected!");
   }
 
-  // Khởi tạo mDNS để truy cập bằng tên local (wsn6.local)
-  if (!MDNS.begin("wsn6")) {
-    Serial.println("Lỗi khởi tạo mDNS!");
-  } else {
-    Serial.println("mDNS đã khởi động: http://wsn6.local");
+  // [MỐC 3] Xong WiFi - Hệ thống sẵn sàng
+  unsigned long t_wifi_done = millis();
+  
+  // --- TỔNG KẾT ---
+  Serial.println("-----------------------------------------");
+  Serial.println("[PERF] THỐNG KÊ THỜI GIAN BOOT:");
+  Serial.print("  1. Init Phần cứng: "); Serial.print(t_hw_init_done - t_boot_start); Serial.println(" ms");
+  Serial.print("  2. Load Dữ liệu:   "); Serial.print(t_fs_done - t_hw_init_done); Serial.println(" ms");
+  Serial.print("  3. Kết nối WiFi:   "); Serial.print(t_wifi_done - t_fs_done); Serial.println(" ms");
+  Serial.print("  => TỔNG CỘNG:      "); Serial.print(t_wifi_done); Serial.println(" ms");
+  Serial.println("=========================================\n");
+
+  // Khởi tạo các dịch vụ sau khi đã có mạng
+  if (MDNS.begin("wsn6")) {
     MDNS.addService("http", "tcp", 80);
   }
-
-  delay(500);
   configureWebServer();
   server.begin();
-
-  // Tạo mutex và queue
+  
   xSensorDataMutex = xSemaphoreCreateMutex();
   xAlertQueue = xQueueCreate(5, sizeof(bool));
-
-  // Đồng bộ thời gian từ NTP (GMT+7)
   configTime(7 * 3600, 0, "pool.ntp.org");
 
-  // Tạo các FreeRTOS tasks: đọc cảm biến, logic, gửi alert
   xTaskCreatePinnedToCore(sensorReadTask, "SensorReadTask", 4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(logicControlTask, "LogicControlTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(alertSendTask, "AlertSendTask", 8192, NULL, 0, NULL, 0);
+  
+  // Cập nhật trạng thái mạng ban đầu cho hàm debug
+  wasWiFiConnected = (WiFi.status() == WL_CONNECTED);
 }
 
 // --- WEB SERVER ---
@@ -348,9 +399,18 @@ void sensorReadTask(void *pvParameters) {
   unsigned long lastDHTRead = 0;
 
   for (;;) {
+    unsigned long t_start_read = micros();
     // 1. ĐỌC CẢM BIẾN NHANH (MQ2, IR) - cập nhật liên tục mỗi ~100ms
     int rawFire = 4095 - analogRead(PIN_IR_SENSOR); // đảo chiều nếu cần
-    int rawMq = analogRead(PIN_MQ02);
+    int rawMq = MQGetPPM(PIN_MQ02);
+    unsigned long t_end_read = micros();
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 2000) {
+        Serial.print("[TEST] Thời gian đọc Sensor (Analog): ");
+        Serial.print(t_end_read - t_start_read);
+        Serial.println(" us (micro-seconds)");
+        lastPrint = millis();
+    }
 
     // Cập nhật các biến toàn cục (dùng mutex)
     if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -403,7 +463,7 @@ void logicControlTask(void *pvParameters) {
     } else {
       vTaskDelay(100); continue;
     }
-
+    unsigned long t_start_logic = micros();
     // Logic kết hợp để xác định Fire / GasLeak
     bool isFire = false;
     bool isGasLeak = false;
@@ -423,7 +483,14 @@ void logicControlTask(void *pvParameters) {
     } else if (isGasLeak) {
         buzzer = true; pump = false; fan = true;
     }
-
+    unsigned long t_end_logic = micros();
+    static unsigned long lastPrintLogic = 0;
+    if (millis() - lastPrintLogic > 2000) {
+       Serial.print("[TEST] Thời gian xử lý Logic: ");
+       Serial.print(t_end_logic - t_start_logic);
+       Serial.println(" us");
+       lastPrintLogic = millis();
+    }
     // Nếu mới phát hiện cảnh báo, push queue để task gửi mail xử lý
     bool currentAlarmState = (isFire || isGasLeak);
     if (currentAlarmState && !lastAlarmState) {
@@ -473,7 +540,8 @@ void alertSendTask(void *pvParameters) {
              emailTo = g_recipientEmail;
              xSemaphoreGive(xSensorDataMutex);
         } else continue;
-
+        Serial.println("[TEST] Bắt đầu quy trình gửi Email...");
+        unsigned long t_start_email = millis(); // Bắt đầu bấm giờ
         // Kết nối SMTP và gửi mail
         ssl_client.setInsecure(); // không verify cert (đơn giản)
         if (!smtp.connect(SMTP_HOST, SMTP_PORT)) continue;
@@ -499,6 +567,10 @@ void alertSendTask(void *pvParameters) {
         smtp.send(msg);
         smtp.stop();
         Serial.println("Đã gửi mail.");
+        unsigned long t_end_email = millis(); // Kết thúc bấm giờ
+        Serial.print("[TEST] Tổng thời gian gửi Email (SMTP): ");
+        Serial.print(t_end_email - t_start_email);
+        Serial.println(" ms");
     }
   }
 }
@@ -538,9 +610,43 @@ void updateStatusLEDs() {
   }
 }
 
-// loop chính: chạy ở task chính, chỉ kiểm tra nút và LED
+
+void debugWiFiRecovery() {
+  // Lấy trạng thái hiện tại
+  bool isConnected = (WiFi.status() == WL_CONNECTED);
+
+  // TRƯỜNG HỢP 1: Đang có mạng -> Mất mạng
+  if (wasWiFiConnected && !isConnected) {
+    t_wifi_lost_start = millis(); // Bấm giờ ngay lập tức
+    wasWiFiConnected = false;
+    
+    Serial.println("------------------------------------------------");
+    Serial.println("[EVENT] PHÁT HIỆN MẤT KẾT NỐI WIFI!");
+    Serial.print("[TIME] Timestamp: ");
+    Serial.println(t_wifi_lost_start);
+    Serial.println("[LED] Đèn báo lỗi (Đỏ) đã bật."); 
+    // Lúc này trong hàm updateStatusLEDs() đèn đỏ sẽ sáng
+  }
+
+  // TRƯỜNG HỢP 2: Đang mất mạng -> Có mạng lại
+  else if (!wasWiFiConnected && isConnected) {
+    unsigned long t_reconnect_end = millis(); // Bấm giờ kết thúc
+    unsigned long duration = t_reconnect_end - t_wifi_lost_start;
+    
+    wasWiFiConnected = true;
+
+    Serial.println("[EVENT] ĐÃ KẾT NỐI LẠI THÀNH CÔNG!");
+    Serial.print("[METRIC] Thời gian gián đoạn (Recovery Time): ");
+    Serial.print(duration);
+    Serial.println(" ms");
+    Serial.print("[INFO] IP Mới được cấp: ");
+    Serial.println(WiFi.localIP());
+    Serial.println("------------------------------------------------");
+  }
+}
 void loop() {
   checkResetButton();
   updateStatusLEDs();
+  debugWiFiRecovery();
   vTaskDelay(pdMS_TO_TICKS(100));
 }
