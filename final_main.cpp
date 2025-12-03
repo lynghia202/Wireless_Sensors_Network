@@ -40,7 +40,7 @@ DHT dht(PIN_DHT, DHTTYPE);
 #define AUTHOR_PASSWORD "blev fslf uesq rgra"
 String g_recipientEmail = "lynghia736@gmail.com";
 
-// ====== BIẾN TOÀN CỤC ======
+// ====== BIẾN TOÀN CỤC SENSOR ======
 volatile int g_rawFireValue = 0;
 volatile int g_rawCo2Value = 0;
 volatile float g_temperature = 0.0;
@@ -53,6 +53,31 @@ volatile bool g_fanState = false;
 volatile int g_fireThreshold = 3000;
 volatile int g_co2Threshold = 1500;
 volatile float g_tempThreshold = 50.0;
+
+// ====== BIẾN ĐĂNG NHẬP & BẢO MẬT ======
+String g_adminPass = "admin";
+bool g_isDefaultPass = true;
+
+// Quản lý phiên đăng nhập
+IPAddress g_loggedInIP(0,0,0,0);
+unsigned long g_lastActivityTime = 0;
+#define SESSION_TIMEOUT 300000 // 5 phút
+
+// Quản lý khóa đăng nhập (Brute-force protection)
+#define MAX_LOGIN_ATTEMPTS 5
+#define LOCKOUT_DURATION_BASE 30000  // 30 giây
+#define LOCKOUT_MULTIPLIER 3         // Nhân lên mỗi lần bị khóa
+
+struct LoginAttemptTracker {
+    int failedCount = 0;
+    unsigned long lockoutEndTime = 0;
+    unsigned long lockoutDuration = LOCKOUT_DURATION_BASE;
+    unsigned long lastAttemptTime = 0;
+} g_loginTracker;
+
+// Chống spam request đăng nhập
+#define MIN_REQUEST_INTERVAL 1000  // 1 giây giữa các request
+unsigned long g_lastLoginRequestTime = 0;
 
 const char* CONFIG_FILE = "/config.json";
 
@@ -70,6 +95,7 @@ std::vector<String> g_historyLog;
 WiFiClientSecure ssl_client;
 SMTPClient smtp(ssl_client);
 
+// ====== FORWARD DECLARATIONS ======
 void sensorReadTask(void *pvParameters);
 void logicControlTask(void *pvParameters);
 void alertSendTask(void *pvParameters);
@@ -78,6 +104,11 @@ void loadSettings();
 void saveSettings();
 void checkResetButton();
 void updateStatusLEDs();
+void addHistoryEvent(String message, bool isDanger);
+bool isLockedOut();
+void recordFailedLogin();
+void recordSuccessLogin();
+bool isAuthenticated(AsyncWebServerRequest *request);
 
 // ====== THÔNG SỐ DATASHEET MQ2 ======
 #define RL_VALUE         10.0  
@@ -106,51 +137,7 @@ int MQGetPPM(int mq_pin) {
   return (int)ppm;
 }
 
-// --- CÁC HÀM QUẢN LÝ CẤU HÌNH  ---
-
-void loadSettings() {
-  if (!SPIFFS.exists(CONFIG_FILE)) {
-    Serial.println("Chưa có file cấu hình, dùng tham số mặc định.");
-    return;
-  }
-
-  File file = SPIFFS.open(CONFIG_FILE, "r");
-  if (!file) return;
-
-  DynamicJsonDocument doc(512);
-  DeserializationError error = deserializeJson(doc, file);
-  file.close();
-
-  if (error) {
-    Serial.println("Lỗi đọc file cấu hình JSON!");
-    return;
-  }
-
-  if (doc["fire"].is<int>()) g_fireThreshold = doc["fire"].as<int>();
-  if (doc["co2"].is<int>())  g_co2Threshold = doc["co2"].as<int>();
-  if (doc["temp"].is<double>()) g_tempThreshold = doc["temp"].as<float>();
-  if (doc["email"].is<const char*>()) g_recipientEmail = doc["email"].as<String>();
-
-  Serial.printf("Đã tải Config: Fire=%d, CO2=%d, Temp=%.1f, Email=%s\n",
-                g_fireThreshold, g_co2Threshold, g_tempThreshold, g_recipientEmail.c_str());
-}
-
-void saveSettings() {
-  DynamicJsonDocument doc(512);
-  doc["fire"] = g_fireThreshold;
-  doc["co2"] = g_co2Threshold;
-  doc["temp"] = g_tempThreshold;
-  doc["email"] = g_recipientEmail;
-
-  File file = SPIFFS.open(CONFIG_FILE, "w");
-  if (!file) {
-    Serial.println("Lỗi mở file config để ghi!");
-    return;
-  }
-  serializeJson(doc, file);
-  file.close();
-  Serial.println("Đã lưu cấu hình mới vào SPIFFS.");
-}
+// ====== HÀM QUẢN LÝ CẤU HÌNH ======
 
 void addHistoryEvent(String message, bool isDanger) {
   String eventJson = "{";
@@ -169,7 +156,362 @@ void addHistoryEvent(String message, bool isDanger) {
   }
 }
 
-// --- SETUP ---
+void loadSettings() {
+  if (!SPIFFS.exists(CONFIG_FILE)) return;
+  File file = SPIFFS.open(CONFIG_FILE, "r");
+  if (!file) return;
+
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, file);
+  file.close();
+
+  if (doc["fire"].is<int>()) g_fireThreshold = doc["fire"];
+  if (doc["co2"].is<int>())  g_co2Threshold = doc["co2"];
+  if (doc["temp"].is<float>()) g_tempThreshold = doc["temp"];
+  if (doc["email"].is<String>()) g_recipientEmail = doc["email"].as<String>();
+  
+  // Load Security Info
+  if (doc.containsKey("adminPass")) g_adminPass = doc["adminPass"].as<String>();
+  if (doc.containsKey("isDefault")) g_isDefaultPass = doc["isDefault"];
+}
+
+void saveSettings() {
+  DynamicJsonDocument doc(1024);
+  doc["fire"] = g_fireThreshold;
+  doc["co2"] = g_co2Threshold;
+  doc["temp"] = g_tempThreshold;
+  doc["email"] = g_recipientEmail;
+  doc["adminPass"] = g_adminPass;
+  doc["isDefault"] = g_isDefaultPass;
+
+  File file = SPIFFS.open(CONFIG_FILE, "w");
+  serializeJson(doc, file);
+  file.close();
+}
+
+// ====== HÀM BẢO MẬT ======
+
+bool isLockedOut() {
+    if (millis() < g_loginTracker.lockoutEndTime) {
+        return true;  // Vẫn đang bị khóa
+    }
+    
+    // Hết thời gian khóa → Reset
+    if (g_loginTracker.lockoutEndTime > 0 && millis() >= g_loginTracker.lockoutEndTime) {
+        g_loginTracker.failedCount = 0;
+        g_loginTracker.lockoutEndTime = 0;
+        Serial.println("[AUTH] Lockout expired. Reset counter.");
+    }
+    
+    return false;
+}
+
+void recordFailedLogin() {
+    g_loginTracker.failedCount++;
+    g_loginTracker.lastAttemptTime = millis();
+    
+    Serial.printf("[AUTH] Failed login attempt #%d\n", g_loginTracker.failedCount);
+    
+    if (g_loginTracker.failedCount >= MAX_LOGIN_ATTEMPTS) {
+        // Kích hoạt khóa
+        g_loginTracker.lockoutEndTime = millis() + g_loginTracker.lockoutDuration;
+        
+        Serial.printf("[AUTH] ACCOUNT LOCKED for %lu seconds\n", 
+                     g_loginTracker.lockoutDuration / 1000);
+        
+        // Tăng thời gian khóa cho lần sau (exponential backoff)
+        g_loginTracker.lockoutDuration *= LOCKOUT_MULTIPLIER;
+        
+        // Log event (đã có hàm addHistoryEvent ở trên rồi)
+        addHistoryEvent("CẢNH BÁO: Tài khoản bị khóa do đăng nhập sai quá nhiều", true);
+    }
+}
+
+void recordSuccessLogin() {
+    // Reset tất cả khi đăng nhập thành công
+    g_loginTracker.failedCount = 0;
+    g_loginTracker.lockoutEndTime = 0;
+    g_loginTracker.lockoutDuration = LOCKOUT_DURATION_BASE;
+    Serial.println("[AUTH] Login successful. Counter reset.");
+}
+
+bool isAuthenticated(AsyncWebServerRequest *request) {
+    if (request->client()->remoteIP() == g_loggedInIP) {
+        if (millis() - g_lastActivityTime < SESSION_TIMEOUT) {
+            g_lastActivityTime = millis(); // Gia hạn session
+            return true;
+        } else {
+            // Session hết hạn
+            Serial.println("[AUTH] Session expired.");
+            g_loggedInIP = IPAddress(0,0,0,0);
+        }
+    }
+    return false;
+}
+
+// ====== CẤU HÌNH WEB SERVER ======
+
+void configureWebServer() {
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        if (request->method() == HTTP_OPTIONS) {
+            request->send(200);
+        } else {
+            request->send(404);
+        }
+    });
+
+    //API LOGIN
+    AsyncCallbackJsonWebHandler* loginHandler = new AsyncCallbackJsonWebHandler("/login", 
+  [](AsyncWebServerRequest *request, JsonVariant &json) {
+    
+    // Rate limiting
+    if (millis() - g_lastLoginRequestTime < MIN_REQUEST_INTERVAL) {
+        Serial.println("[AUTH] Rate limit exceeded");
+        request->send(429, "application/json", 
+                     "{\"error\": \"Too many requests. Please wait.\"}");
+        return;
+    }
+    g_lastLoginRequestTime = millis();
+    
+    // Lockout check
+    if (isLockedOut()) {
+        long remainingSeconds = (g_loginTracker.lockoutEndTime - millis()) / 1000;
+        
+        String response = "{";
+        response += "\"authenticated\": false,";
+        response += "\"locked\": true,";
+        response += "\"remaining\": " + String(remainingSeconds) + ",";
+        response += "\"failedAttempts\": " + String(g_loginTracker.failedCount) + ",";  
+        response += "\"message\": \"Account locked due to too many failed attempts\"";
+        response += "}";
+        
+        Serial.printf("[AUTH] Login blocked. %ld seconds remaining.\n", remainingSeconds);
+        request->send(403, "application/json", response);
+        return;
+    }
+    
+    // Xác thực
+    JsonObject jsonObj = json.as<JsonObject>();
+    String pass = jsonObj["password"].as<String>();
+    
+    if (pass == g_adminPass) {
+        // THÀNH CÔNG
+        g_loggedInIP = request->client()->remoteIP();
+        g_lastActivityTime = millis();
+        recordSuccessLogin();
+        
+        String response = "{";
+        response += "\"authenticated\": true,";
+        response += "\"isDefault\": " + String(g_isDefaultPass ? "true" : "false") + ",";
+        response += "\"failedAttempts\": 0,";  //  Reset về 0
+        response += "\"locked\": false";
+        response += "}";
+        
+        Serial.printf("[AUTH] ✓ Login successful from IP: %s\n", 
+                     g_loggedInIP.toString().c_str());
+        
+        addHistoryEvent("Đăng nhập thành công", false);
+        request->send(200, "application/json", response);
+        
+    } else {
+        // SAI MẬT KHẨU
+        recordFailedLogin();
+        
+        bool nowLocked = isLockedOut();
+        long remainingSeconds = nowLocked ? 
+            (g_loginTracker.lockoutEndTime - millis()) / 1000 : 0;
+        
+        String response = "{";
+        response += "\"authenticated\": false,";
+        response += "\"locked\": " + String(nowLocked ? "true" : "false") + ",";
+        response += "\"remaining\": " + String(remainingSeconds) + ",";
+        response += "\"failedAttempts\": " + String(g_loginTracker.failedCount) + ",";  
+        response += "\"message\": \"Invalid password\"";
+        response += "}";
+        
+        Serial.printf("[AUTH] Invalid password. Attempts: %d/%d\n", 
+                     g_loginTracker.failedCount, MAX_LOGIN_ATTEMPTS);
+        
+        request->send(401, "application/json", response);
+    }
+});
+server.addHandler(loginHandler);
+
+    
+    //  API LOGOUT 
+   
+    server.on("/logout", HTTP_POST, [](AsyncWebServerRequest *request) {
+        IPAddress clientIP = request->client()->remoteIP();
+        
+        // Chỉ cho phép logout nếu đang đăng nhập
+        if (clientIP == g_loggedInIP) {
+            // XÓA SESSION
+            g_loggedInIP = IPAddress(0,0,0,0);
+            g_lastActivityTime = 0;
+            
+            Serial.printf("[AUTH] Logout successful from IP: %s\n", 
+                         clientIP.toString().c_str());
+            
+            addHistoryEvent("Đăng xuất", false);
+            
+            request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+            request->send(401, "application/json", "{\"error\":\"Not logged in\"}");
+        }
+    });
+
+   
+    //  API AUTH CHECK
+    server.on("/auth-check", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = "{";
+        
+        // 1. Kiểm tra lockout
+        bool locked = isLockedOut();
+        long remainingSeconds = locked ? 
+            (g_loginTracker.lockoutEndTime - millis()) / 1000 : 0;
+        
+        json += "\"locked\": " + String(locked ? "true" : "false") + ",";
+        json += "\"remaining\": " + String(remainingSeconds) + ",";
+        
+        // 2. Kiểm tra session
+        bool isAuth = false;
+        IPAddress clientIP = request->client()->remoteIP();
+        
+        // Chỉ check session khi KHÔNG BỊ KHÓA
+        if (!locked && clientIP == g_loggedInIP) {
+            if (millis() - g_lastActivityTime < SESSION_TIMEOUT) {
+                isAuth = true;
+            } else {
+                // Session hết hạn → Xóa
+                Serial.println("[AUTH] Session expired in auth-check.");
+                g_loggedInIP = IPAddress(0,0,0,0);
+            }
+        }
+        
+        json += "\"authenticated\": " + String(isAuth ? "true" : "false");
+        json += "}";
+        
+        request->send(200, "application/json", json);
+    });
+
+   
+    //  API DATA (Cần Auth)
+    server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!isAuthenticated(request)) { 
+            request->send(401, "application/json", "{\"error\": \"Unauthorized\"}"); 
+            return; 
+        }
+
+        String json = "{";
+        if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            json += String("\"fire\":") + String(g_rawFireValue);
+            json += String(", \"co2\":") + String(g_rawCo2Value);
+            json += String(", \"temp\":") + String(g_temperature, 1);
+            json += String(", \"hum\":") + String(g_humidity, 1);
+            json += String(", \"buzzer\":") + String(g_buzzerState ? "true" : "false");
+            json += String(", \"pump\":") + String(g_pumpState ? "true" : "false");
+            json += String(", \"fan\":") + String(g_fanState ? "true" : "false");
+            json += String(", \"recipientEmail\":\"") + g_recipientEmail + "\"";
+            json += String(", \"ssid\":\"") + WiFi.SSID() + "\"";
+            json += String(", \"fireThresh\":") + String(g_fireThreshold);
+            json += String(", \"co2Thresh\":") + String(g_co2Threshold);
+            json += String(", \"tempThresh\":") + String(g_tempThreshold, 1);
+            xSemaphoreGive(xSensorDataMutex);
+            json += "}";
+            request->send(200, "application/json", json);
+        } else {
+            request->send(503, "application/json", "{\"error\": \"Service unavailable\"}");
+        }
+    });
+
+  
+    //  API SETTINGS (Cần Auth)
+
+    AsyncCallbackJsonWebHandler* settingsHandler = new AsyncCallbackJsonWebHandler("/settings", 
+    [](AsyncWebServerRequest *request, JsonVariant &json) {
+        if (!isAuthenticated(request)) { 
+            request->send(401, "application/json", "{\"error\": \"Unauthorized\"}"); 
+            return; 
+        }
+
+        JsonObject jsonObj = json.as<JsonObject>();
+        bool changed = false;
+        bool passwordChanged = false;
+
+        if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            if (jsonObj.containsKey("fireThreshold")) { 
+                g_fireThreshold = jsonObj["fireThreshold"]; 
+                changed = true; 
+            }
+            if (jsonObj.containsKey("co2Threshold")) { 
+                g_co2Threshold = jsonObj["co2Threshold"]; 
+                changed = true; 
+            }
+            if (jsonObj.containsKey("tempThreshold")) { 
+                g_tempThreshold = jsonObj["tempThreshold"]; 
+                changed = true; 
+            }
+            if (jsonObj.containsKey("recipientEmail")) { 
+                g_recipientEmail = jsonObj["recipientEmail"].as<String>(); 
+                changed = true; 
+            }
+            
+            if (jsonObj.containsKey("password")) {
+                String newPass = jsonObj["password"].as<String>();
+                if (newPass.length() >= 4) {
+                    g_adminPass = newPass;
+                    g_isDefaultPass = false;
+                    changed = true;
+                    passwordChanged = true;
+                    Serial.println("[AUTH] Password changed successfully.");
+                }
+            }
+
+            xSemaphoreGive(xSensorDataMutex);
+        } else {
+            request->send(500, "application/json", "{\"error\": \"Internal error\"}");
+            return;
+        }
+
+        if (changed) {
+            saveSettings();
+            if (passwordChanged) {
+                addHistoryEvent("Đã thay đổi mật khẩu", false);
+            }
+        }
+
+        request->send(200, "application/json", "{\"status\":\"ok\"}");
+    });
+    server.addHandler(settingsHandler);
+
+  
+    //  API HISTORY (Cần Auth)
+    server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!isAuthenticated(request)) { 
+            request->send(401, "application/json", "{\"error\": \"Unauthorized\"}"); 
+            return; 
+        }
+        
+        String jsonResponse = "[";
+        if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            for (size_t i = 0; i < g_historyLog.size(); ++i) {
+                jsonResponse += g_historyLog[i];
+                if (i < g_historyLog.size() - 1) jsonResponse += ",";
+            }
+            xSemaphoreGive(xSensorDataMutex);
+        }
+        jsonResponse += "]";
+        request->send(200, "application/json", jsonResponse);
+    });
+
+    server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
+}
+
+// ====== SETUP ======
 
 void setup() {
   Serial.begin(115200);
@@ -215,104 +557,22 @@ void setup() {
   if (MDNS.begin("wsn6")) {
     MDNS.addService("http", "tcp", 80);
   }
-  configureWebServer();
-  server.begin();
   
   xSensorDataMutex = xSemaphoreCreateMutex();
   xAlertQueue = xQueueCreate(5, sizeof(bool));
   configTime(7 * 3600, 0, "pool.ntp.org");
+
+  configureWebServer();
+  server.begin();
 
   xTaskCreatePinnedToCore(sensorReadTask, "SensorReadTask", 4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(logicControlTask, "LogicControlTask", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(alertSendTask, "AlertSendTask", 8192, NULL, 0, NULL, 0);
 }
 
-// --- WEB SERVER ---
-
-void configureWebServer() {
-  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
-
-  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{";
-    if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-      json += String("\"fire\":") + String(g_rawFireValue);
-      json += String(", \"co2\":") + String(g_rawCo2Value);
-      json += String(", \"temp\":") + String(g_temperature, 1);
-      json += String(", \"hum\":") + String(g_humidity, 1);
-
-      json += String(", \"buzzer\":") + String(g_buzzerState ? "true" : "false");
-      json += String(", \"pump\":") + String(g_pumpState ? "true" : "false");
-      json += String(", \"fan\":") + String(g_fanState ? "true" : "false");
-
-      json += String(", \"recipientEmail\":\"") + g_recipientEmail + "\"";
-      json += String(", \"ssid\":\"") + WiFi.SSID() + "\"";
-      json += String(", \"fireThresh\":") + String(g_fireThreshold);
-      json += String(", \"co2Thresh\":") + String(g_co2Threshold);
-      json += String(", \"tempThresh\":") + String(g_tempThreshold, 1);
-
-      xSemaphoreGive(xSensorDataMutex);
-      json += "}";
-      request->send(200, "application/json", json);
-    } else {
-      request->send(503, "application/json", "{\"error\":\"Busy\"}");
-    }
-  });
-
-  AsyncCallbackJsonWebHandler* handler = new AsyncCallbackJsonWebHandler("/settings", [](AsyncWebServerRequest *request, JsonVariant &json) {
-    JsonObject jsonObj = json.as<JsonObject>();
-    bool changed = false;
-
-    if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (jsonObj["fireThreshold"].is<int>()) {
-            g_fireThreshold = jsonObj["fireThreshold"].as<int>();
-            changed = true;
-        }
-        if (jsonObj["co2Threshold"].is<int>()) {
-            g_co2Threshold = jsonObj["co2Threshold"].as<int>();
-            changed = true;
-        }
-        if (jsonObj["tempThreshold"].is<double>()) {
-            g_tempThreshold = jsonObj["tempThreshold"].as<float>();
-            changed = true;
-        }
-        if (jsonObj["recipientEmail"].is<const char*>()) {
-            g_recipientEmail = jsonObj["recipientEmail"].as<String>();
-            changed = true;
-        }
-
-        if (changed) {
-            saveSettings();
-        }
-
-        xSemaphoreGive(xSensorDataMutex);
-        request->send(200, "application/json", "{\"status\":\"ok\"}");
-    } else {
-        request->send(500, "application/json", "{\"status\":\"fail\"}");
-    }
-  });
-  server.addHandler(handler);
-
-  server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String jsonResponse = "[";
-    if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      for (size_t i = 0; i < g_historyLog.size(); ++i) {
-        jsonResponse += g_historyLog[i];
-        if (i < g_historyLog.size() - 1) jsonResponse += ",";
-      }
-      xSemaphoreGive(xSensorDataMutex);
-    }
-    jsonResponse += "]";
-    request->send(200, "application/json", jsonResponse);
-  });
-
-  server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
-}
-
-// --- TASKS ---
 
 void sensorReadTask(void *pvParameters) {
   unsigned long lastDHTRead = 0;
-
   for (;;) {
     int rawFire = 4095 - analogRead(PIN_IR_SENSOR);
     int rawMq = MQGetPPM(PIN_MQ02);
@@ -327,7 +587,6 @@ void sensorReadTask(void *pvParameters) {
         lastDHTRead = millis();
         float t = dht.readTemperature();
         float h = dht.readHumidity();
-
         if (!isnan(t) && !isnan(h)) {
              if (xSemaphoreTake(xSensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 g_temperature = t;
@@ -336,11 +595,9 @@ void sensorReadTask(void *pvParameters) {
              }
         }
     }
-
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
-
 void logicControlTask(void *pvParameters) {
   static bool lastAlarmState = false;
 
@@ -450,26 +707,60 @@ void alertSendTask(void *pvParameters) {
     }
   }
 }
+void performFactoryReset() {
+  Serial.println("\n[SYSTEM] Đang thực hiện Factory Reset...");
+  
+  // 1. Nháy đèn báo hiệu cho người dùng biết
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(PIN_LED_WIFI_OK, !digitalRead(PIN_LED_WIFI_OK));
+    digitalWrite(PIN_LED_WIFI_ERR, !digitalRead(PIN_LED_WIFI_ERR));
+    delay(200);
+  }
+  
+  // 2. Xóa cấu hình WiFi cũ
+  wm.resetSettings();
+  Serial.println("- Đã xóa cấu hình WiFi.");
+
+  // 3. Xóa file Config (Mật khẩu, Ngưỡng...)
+  if (SPIFFS.exists(CONFIG_FILE)) {
+    SPIFFS.remove(CONFIG_FILE);
+    Serial.println("- Đã xóa file config.json (Reset mật khẩu).");
+  } else {
+    Serial.println("- Không tìm thấy file config, bỏ qua.");
+  }
+
+  Serial.println("[SYSTEM] Reset hoàn tất! Đang khởi động lại...");
+  delay(1000);
+  ESP.restart();
+}
 
 void checkResetButton() {
+  // Biến static để lưu trạng thái giữa các lần gọi loop
   static unsigned long pressStartTime = 0;
   static bool isPressing = false;
 
-  if (digitalRead(PIN_BUTTON_RESET) == HIGH) {
+  if (digitalRead(PIN_BUTTON_RESET) == HIGH) { 
+    // Bắt đầu nhấn
     if (!isPressing) {
       isPressing = true;
       pressStartTime = millis();
+      Serial.println("[BTN] Nút Reset đang được giữ...");
     }
-    if (millis() - pressStartTime > 5000) {
-      Serial.println("Đang Reset WifiManager...");
-      digitalWrite(PIN_LED_WIFI_OK, HIGH);
-      digitalWrite(PIN_LED_WIFI_ERR, LOW);
-      wm.resetSettings();
-      delay(1000);
-      ESP.restart();
+    
+    // Tính thời gian giữ
+    unsigned long holdTime = millis() - pressStartTime;
+
+    // Nếu giữ > 5 giây -> Kích hoạt Reset
+    if (holdTime > 5000) {
+      performFactoryReset();
+      isPressing = false; 
     }
   } else {
-    isPressing = false;
+    // Nhả nút
+    if (isPressing) {
+      isPressing = false;
+      Serial.println("[BTN] Đã nhả nút (Hủy thao tác Reset).");
+    }
   }
 }
 
